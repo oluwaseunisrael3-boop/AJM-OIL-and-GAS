@@ -812,6 +812,8 @@ async function renderCeoDashboard(){
     html += renderCeoBranchesTab();
   } else if(STATE.tab === 'staff'){
     html += `<div id="staff-tab-content"><div class="center-pad"><div class="loader"></div></div></div>`;
+  } else if(STATE.tab === 'audit'){
+    html += renderCeoAuditTab();
   } else if(STATE.tab === 'settings'){
     html += renderCeoSettingsTab();
   }
@@ -886,12 +888,59 @@ function renderCeoApprovalsTab(pending){
   let flagged = allFlaggedDiscrepancies();
   return `
     <div class="tabs">
-      <div class="tab ${STATE.approvalSubTab!=='discrepancy'?'active':''}" onclick="setApprovalSubTab('queue')">Pending Queue</div>
-      <div class="tab ${STATE.approvalSubTab==='discrepancy'?'active':''}" onclick="setApprovalSubTab('discrepancy')">Discrepancy Log</div>
+      <div class="tab ${(!STATE.approvalSubTab || STATE.approvalSubTab==='queue')?'active':''}" onclick="setApprovalSubTab('queue')">Pending</div>
+      <div class="tab ${STATE.approvalSubTab==='discrepancy'?'active':''}" onclick="setApprovalSubTab('discrepancy')">Discrepancies</div>
+      <div class="tab ${STATE.approvalSubTab==='records'?'active':''}" onclick="setApprovalSubTab('records')">All Records</div>
     </div>
-    ${STATE.approvalSubTab === 'discrepancy' ? renderDiscrepancyLog(flagged) : renderApprovalQueue(pending)}
+    ${STATE.approvalSubTab === 'discrepancy' ? renderDiscrepancyLog(flagged)
+      : STATE.approvalSubTab === 'records' ? renderAllRecordsTab()
+      : renderApprovalQueue(pending)}
   `;
 }
+
+function renderAllRecordsTab(){
+  const branchOptions = '<option value="all">All Branches</option>' + STATE.branches.map(b=>`<option value="${b.id}">${b.name}</option>`).join('');
+  const filterBranch = STATE.recordsFilterBranch || 'all';
+  let html = `
+    <div class="field"><label>Filter by Branch</label>
+      <select id="records-branch-filter" onchange="setRecordsFilterBranch(this.value)">${branchOptions}</select>
+    </div>
+    <p class="hint" style="color:var(--text-dim);font-size:12px;margin-bottom:14px;">Deleting a record is permanent and cannot be undone. Use this only to correct genuine mistakes.</p>
+  `;
+
+  const matches = (row) => filterBranch === 'all' || row.branch_id === filterBranch;
+
+  const sections = [
+    {label:'Deliveries', kind:'delivery', rows: CEO_DATA_CACHE.deliveries.filter(matches), render: r=>litres(r.litres)+' @ '+money(r.price_per_litre)+'/L · '+fmtDate(r.delivery_date)},
+    {label:'Sales', kind:'sale', rows: CEO_DATA_CACHE.sales.filter(matches), render: r=>litres(r.litres_sold)+' sold, revenue '+money(r.expected_revenue)+' · '+fmtDate(r.sale_date)},
+    {label:'Remittances', kind:'remittance', rows: CEO_DATA_CACHE.remittances.filter(matches), render: r=>money(r.amount_remitted)+' remitted · '+fmtDate(r.remit_date)},
+    {label:'Expenses', kind:'expense', rows: CEO_DATA_CACHE.expenses.filter(matches), render: r=>money(r.amount)+' — '+(r.category||'')+' · '+fmtDate(r.expense_date)},
+  ];
+
+  sections.forEach(sec=>{
+    html += `<div class="section-title">${sec.label}</div>`;
+    if(sec.rows.length===0){
+      html += `<div class="empty-state"><p>No ${sec.label.toLowerCase()} recorded.</p></div>`;
+    } else {
+      sec.rows.forEach(r=>{
+        html += `
+          <div class="card">
+            <div class="card-row">
+              <div><div class="card-title">${r.ajm_branches?r.ajm_branches.name:''}</div><div class="card-meta">${sec.render(r)}</div></div>
+              <span class="pill pill-${r.status}">${r.status}</span>
+            </div>
+            <div class="card-actions">
+              <button class="btn btn-outline btn-sm" style="flex:1;color:#ff9d9f;border-color:#5c1f22;" onclick="confirmDeleteItem('${sec.kind}','${r.id}')">Delete</button>
+            </div>
+          </div>
+        `;
+      });
+    }
+  });
+  return html;
+}
+
+function setRecordsFilterBranch(v){ STATE.recordsFilterBranch = v; render(); }
 
 function setApprovalSubTab(t){ STATE.approvalSubTab = t; render(); }
 
@@ -935,6 +984,9 @@ function renderApprovalQueue(pending){
           <button class="btn btn-primary btn-sm" style="flex:1;" onclick="approveItem('${item.kind}','${r.id}')">Approve</button>
           <button class="btn btn-danger btn-sm" style="flex:1;" onclick="rejectItem('${item.kind}','${r.id}')">Reject</button>
         </div>
+        <div class="card-actions">
+          <button class="btn btn-outline btn-sm" style="flex:1;color:#ff9d9f;border-color:#5c1f22;" onclick="confirmDeleteItem('${item.kind}','${r.id}')">Delete Permanently</button>
+        </div>
       </div>
     `;
   }).join('');
@@ -968,6 +1020,29 @@ async function rejectItem(kind, id){
   const table = {delivery:'ajm_deliveries', sale:'ajm_sales', remittance:'ajm_remittances', expense:'ajm_expenses'}[kind];
   await db.from(table).update({status:'rejected'}).eq('id', id);
   toast('Rejected', 'error');
+  render();
+}
+
+// ============ DELETE WITH CONFIRMATION ============
+function confirmDeleteItem(kind, id){
+  openSheet(`
+    <div class="sheet-header"><h3>Delete Record?</h3><div class="sheet-close" onclick="closeSheet()">&times;</div></div>
+    <div class="discrepancy-banner">
+      <div class="ic">⚠</div>
+      <div class="txt"><b>This action is permanent.</b> The record will be removed completely and cannot be recovered. Only delete if this entry was made in error.</div>
+    </div>
+    <button class="btn btn-danger" onclick="executeDeleteItem('${kind}','${id}')">Yes, Delete Permanently</button>
+    <div style="height:10px;"></div>
+    <button class="btn btn-outline" onclick="closeSheet()">Cancel</button>
+  `);
+}
+
+async function executeDeleteItem(kind, id){
+  const table = {delivery:'ajm_deliveries', sale:'ajm_sales', remittance:'ajm_remittances', expense:'ajm_expenses'}[kind];
+  const {error} = await db.from(table).delete().eq('id', id);
+  closeSheet();
+  if(error){ toast('Error deleting: '+error.message, 'error'); return; }
+  toast('Record deleted');
   render();
 }
 
@@ -1055,6 +1130,166 @@ async function submitEditBranch(id){
   render();
 }
 
+// ============ MONTHLY AUDIT ============
+function currentMonthValue(){
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
+}
+
+function renderCeoAuditTab(){
+  if(!STATE.auditMonth) STATE.auditMonth = currentMonthValue();
+  if(!STATE.auditBranch) STATE.auditBranch = STATE.branches[0] ? STATE.branches[0].id : '';
+
+  const branchOptions = STATE.branches.map(b=>`<option value="${b.id}" ${b.id===STATE.auditBranch?'selected':''}>${b.name}</option>`).join('');
+
+  let html = `
+    <div class="section-title">Monthly Audit</div>
+    <div class="card">
+      <div class="row-2">
+        <div class="field"><label>Branch</label>
+          <select id="audit-branch-select" onchange="setAuditBranch(this.value)">${branchOptions}</select>
+        </div>
+        <div class="field"><label>Month</label>
+          <input type="month" id="audit-month-select" value="${STATE.auditMonth}" onchange="setAuditMonth(this.value)">
+        </div>
+      </div>
+    </div>
+  `;
+
+  html += buildAuditReport(STATE.auditBranch, STATE.auditMonth);
+  return html;
+}
+
+function setAuditBranch(v){ STATE.auditBranch = v; render(); }
+function setAuditMonth(v){ STATE.auditMonth = v; render(); }
+
+function buildAuditReport(branchId, monthValue){
+  const branch = STATE.branches.find(b=>b.id===branchId);
+  if(!branch) return '<div class="empty-state"><p>Select a branch to audit.</p></div>';
+
+  const [year, month] = monthValue.split('-').map(Number);
+  const monthStart = monthValue + '-01';
+  const monthEndDate = new Date(year, month, 0); // last day of month
+  const monthEnd = monthEndDate.toISOString().slice(0,10);
+
+  const inRange = (dateStr) => dateStr >= monthStart && dateStr <= monthEnd;
+  const beforeRange = (dateStr) => dateStr < monthStart;
+
+  // Only consider approved records for the audit — this is the CEO's official reconciliation
+  const deliveriesInMonth = CEO_DATA_CACHE.deliveries.filter(d=>d.branch_id===branchId && d.status==='approved' && inRange(d.delivery_date));
+  const salesInMonth = CEO_DATA_CACHE.sales.filter(s=>s.branch_id===branchId && s.status==='approved' && inRange(s.sale_date));
+  const remitInMonth = CEO_DATA_CACHE.remittances.filter(r=>r.branch_id===branchId && r.status==='approved' && inRange(r.remit_date));
+  const expInMonth = CEO_DATA_CACHE.expenses.filter(e=>e.branch_id===branchId && e.status==='approved' && inRange(e.expense_date));
+
+  // Opening stock = everything approved before this month
+  const deliveriesBefore = CEO_DATA_CACHE.deliveries.filter(d=>d.branch_id===branchId && d.status==='approved' && beforeRange(d.delivery_date));
+  const salesBefore = CEO_DATA_CACHE.sales.filter(s=>s.branch_id===branchId && s.status==='approved' && beforeRange(s.sale_date));
+  const openingStock = deliveriesBefore.reduce((s,x)=>s+Number(x.litres),0) - salesBefore.reduce((s,x)=>s+Number(x.litres_sold),0);
+
+  const litresIn = deliveriesInMonth.reduce((s,x)=>s+Number(x.litres),0);
+  const litresOut = salesInMonth.reduce((s,x)=>s+Number(x.litres_sold),0);
+  const closingStock = openingStock + litresIn - litresOut;
+
+  const expectedRevenue = salesInMonth.reduce((s,x)=>s+Number(x.expected_revenue),0);
+  const actualRemitted = remitInMonth.reduce((s,x)=>s+Number(x.amount_remitted),0);
+  const totalExpenses = expInMonth.reduce((s,x)=>s+Number(x.amount),0);
+  const activeStaffAtBranch = CEO_DATA_CACHE.staff.filter(s=>s.branch_id===branchId && s.active);
+  const monthlySalaries = activeStaffAtBranch.reduce((s,x)=>s+Number(x.salary||0),0);
+
+  const revenueGap = expectedRevenue - actualRemitted;
+  const netProfit = actualRemitted - totalExpenses - monthlySalaries;
+
+  const monthDiscrepancies = remitInMonth.filter(r=>r.expected_amount!=null && Number(r.discrepancy) < -0.01);
+  const totalDeliveryCost = deliveriesInMonth.reduce((s,x)=>s+Number(x.litres)*Number(x.price_per_litre),0);
+
+  const monthLabel = new Date(year, month-1, 1).toLocaleDateString('en-NG', {month:'long', year:'numeric'});
+
+  let discrepancyRows = '';
+  if(monthDiscrepancies.length > 0){
+    discrepancyRows = monthDiscrepancies.map(r=>`
+      <div class="card" style="border-color:#5c1f22;">
+        <div class="card-title" style="color:#ff9d9f;">Shortfall on ${fmtDate(r.remit_date)}</div>
+        <div class="card-body">Expected: <b>${money(r.expected_amount)}</b> · Remitted: <b>${money(r.amount_remitted)}</b> · Missing: <b>${money(Math.abs(r.discrepancy))}</b>
+        ${r.manager_note ? '<br>Note: '+r.manager_note : ''}</div>
+      </div>
+    `).join('');
+  } else {
+    discrepancyRows = '<div class="empty-state"><p>No shortfalls this month. All remittances match expected revenue.</p></div>';
+  }
+
+  return `
+    <div class="section-title">${branch.name} — ${monthLabel}</div>
+
+    <div class="section-title" style="margin-top:12px;">Stock Reconciliation</div>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="label">Opening Stock</div><div class="value">${litres(openingStock)}</div></div>
+      <div class="stat-card"><div class="label">Delivered This Month</div><div class="value">${litres(litresIn)}</div></div>
+      <div class="stat-card"><div class="label">Sold This Month</div><div class="value">${litres(litresOut)}</div></div>
+      <div class="stat-card ${closingStock<0?'alert':''}"><div class="label">Closing Stock</div><div class="value">${litres(closingStock)}</div></div>
+    </div>
+
+    <div class="section-title" style="margin-top:18px;">Financial Reconciliation</div>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="label">Cost of Fuel Delivered</div><div class="value">${money(totalDeliveryCost)}</div></div>
+      <div class="stat-card"><div class="label">Expected Sales Revenue</div><div class="value">${money(expectedRevenue)}</div></div>
+      <div class="stat-card"><div class="label">Actual Amount Remitted</div><div class="value">${money(actualRemitted)}</div></div>
+      <div class="stat-card ${revenueGap>0?'alert':'good'}"><div class="label">Revenue Gap</div><div class="value">${money(revenueGap)}</div><div class="sub">${revenueGap>0?'Under-remitted':'Fully accounted'}</div></div>
+      <div class="stat-card"><div class="label">Total Expenses</div><div class="value">${money(totalExpenses)}</div></div>
+      <div class="stat-card"><div class="label">Salary Bill (${activeStaffAtBranch.length} staff)</div><div class="value">${money(monthlySalaries)}</div></div>
+    </div>
+
+    <div class="card" style="margin-top:14px;border-color:${netProfit>=0?'var(--success)':'var(--danger)'};">
+      <div class="card-title">Net Result for ${monthLabel}</div>
+      <div style="font-size:24px;font-weight:800;margin-top:6px;color:${netProfit>=0?'#7de3ab':'#ff9d9f'};">${money(netProfit)}</div>
+      <div class="card-meta">Remitted minus expenses minus salaries</div>
+    </div>
+
+    <div class="section-title" style="margin-top:18px;">Discrepancies Flagged This Month</div>
+    ${discrepancyRows}
+
+    <div class="section-title" style="margin-top:18px;">Activity Count</div>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="label">Deliveries Logged</div><div class="value">${deliveriesInMonth.length}</div></div>
+      <div class="stat-card"><div class="label">Sales Days Logged</div><div class="value">${salesInMonth.length}</div></div>
+      <div class="stat-card"><div class="label">Remittances Logged</div><div class="value">${remitInMonth.length}</div></div>
+      <div class="stat-card"><div class="label">Expenses Logged</div><div class="value">${expInMonth.length}</div></div>
+    </div>
+
+    <button class="btn btn-gold" style="margin-top:16px;" onclick="copyAuditSummary('${branch.name}','${monthLabel}',${openingStock},${litresIn},${litresOut},${closingStock},${totalDeliveryCost},${expectedRevenue},${actualRemitted},${revenueGap},${totalExpenses},${monthlySalaries},${netProfit},${monthDiscrepancies.length})">Copy Audit Summary as Text</button>
+  `;
+}
+
+function copyAuditSummary(branchName, monthLabel, openingStock, litresIn, litresOut, closingStock, deliveryCost, expectedRevenue, actualRemitted, revenueGap, totalExpenses, salaries, netProfit, discrepancyCount){
+  const text = `AJM OIL AND GAS — MONTHLY AUDIT REPORT
+Branch: ${branchName}
+Period: ${monthLabel}
+Prepared for: Ayobami Olujide (CEO)
+
+STOCK RECONCILIATION
+Opening Stock: ${litres(openingStock)}
+Delivered This Month: ${litres(litresIn)}
+Sold This Month: ${litres(litresOut)}
+Closing Stock: ${litres(closingStock)}
+
+FINANCIAL RECONCILIATION
+Cost of Fuel Delivered: ${money(deliveryCost)}
+Expected Sales Revenue: ${money(expectedRevenue)}
+Actual Amount Remitted: ${money(actualRemitted)}
+Revenue Gap: ${money(revenueGap)}
+Total Expenses: ${money(totalExpenses)}
+Salary Bill: ${money(salaries)}
+
+NET RESULT: ${money(netProfit)}
+
+Discrepancies Flagged: ${discrepancyCount}
+`;
+  navigator.clipboard.writeText(text).then(()=>{
+    toast('Audit summary copied to clipboard');
+  }).catch(()=>{
+    toast('Could not copy — please screenshot instead', 'error');
+  });
+}
+
 function renderCeoSettingsTab(){
   return `
     <div class="section-title">Account Settings</div>
@@ -1108,8 +1343,11 @@ function renderCeoBottomNav(pendingCount){
         <div class="nav-icon">⌂</div><div class="nav-label">Home</div>
       </div>
       <div class="nav-item ${STATE.tab==='approvals'?'active':''}" onclick="setCeoTab('approvals')">
-        <div class="nav-icon">✓</div><div class="nav-label">Approvals</div>
+        <div class="nav-icon">✓</div><div class="nav-label">Approve</div>
         ${pendingCount>0?'<div class="badge-dot">'+pendingCount+'</div>':''}
+      </div>
+      <div class="nav-item ${STATE.tab==='audit'?'active':''}" onclick="setCeoTab('audit')">
+        <div class="nav-icon">▦</div><div class="nav-label">Audit</div>
       </div>
       <div class="nav-item ${STATE.tab==='branches'?'active':''}" onclick="setCeoTab('branches')">
         <div class="nav-icon">⌘</div><div class="nav-label">Branches</div>
@@ -1118,7 +1356,7 @@ function renderCeoBottomNav(pendingCount){
         <div class="nav-icon">☺</div><div class="nav-label">Staff</div>
       </div>
       <div class="nav-item ${STATE.tab==='settings'?'active':''}" onclick="setCeoTab('settings')">
-        <div class="nav-icon">⚙</div><div class="nav-label">Settings</div>
+        <div class="nav-icon">⚙</div><div class="nav-label">Setup</div>
       </div>
     </div>
   `;
